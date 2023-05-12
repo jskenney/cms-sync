@@ -1,0 +1,457 @@
+#!/usr/bin/python3 -B
+import sys, os, requests, json, argparse, time, sqlite3, getpass
+
+'''
+Describe this script, for use with argparse output
+'''
+DESC = 'OurSync - Synchronize files with CMS'
+
+'''
+Known issues, TODO's, and notes:
+
+- Soft links are uploaded as files, if the link is bad the program will stop.
+
+'''
+
+'''
+Where should we be taking files from, the root of the sync,
+expectation is that there is a .cms directory at this location.
+
+Current assumption is that this sync will always occure in the
+root of the repo, this may be made more advanced in the future.
+'''
+DIRECTORY = '.'
+
+DIRECTORY = os.path.abspath(DIRECTORY)
+dotcms = DIRECTORY + '/.cms'
+database = os.path.abspath(os.path.join(dotcms, 'db'))
+
+if not os.path.exists(dotcms):
+    print('ERROR:', dotcms, 'has not been created, create', dotcms, 'to continue...')
+    sys.exit()
+
+sys.path.append(dotcms)
+
+'''
+Retrieve authentication information from config.py file, this will include:
+
+API - URL of the cascade api endpoint
+SITE - Cascade Site we will be editing
+APIKEY - Cascade APIKEY so username/passwords can be ignored
+USERNAME - Used if there is no APIKEY
+PASSWORD - Optional if there is no APIKEY (user will be asked for if not in file)
+IGNORE - Optional array of filenames (checking for the beginning of a filename) to ignore
+'''
+try:
+    from config import API
+except:
+    API = 'https://cascade.usna.edu/api/v1/'
+
+try:
+    from config import SITE
+except:
+    SITE = "User Sites CompSci - Public"
+
+try:
+    from config import IGNORE
+except:
+    IGNORE = []
+
+try:
+    from config import ROOT
+except:
+    print('ERROR: Please define the ROOT variable in .cms/config.py to continue')
+    print('ERROR: Example, ROOT="kenney/SI460"')
+    print('ERROR: This is the path you want files in as seen in the CMS web gui')
+    sys.exit()
+
+try:
+    from config import PUBLISH
+except:
+    PUBLISH = ROOT
+
+try:
+    from config import PUBLISH_AS_YOU_GO
+except:
+    PUBLISH_AS_YOU_GO = True
+
+try:
+    from config import APIKEY
+except:
+    APIKEY=None
+    try:
+        from config import USERNAME
+    except:
+        USERNAME=None
+    try:
+        from config import PASSWORD
+    except:
+        PASSWORD=None
+
+'''
+Simple function to look for matches, particulary to see if a file should
+be ignored
+'''
+def match(haystack, needle):
+    for straw in haystack:
+        if needle.find(straw) == 0:
+            return 1
+    return 0
+
+'''
+Create a list of all files in the DIRECTORY that:
+Do not start with . AND are world readable
+'''
+filesScanned = {}
+for root, dirnames, filenames in os.walk(DIRECTORY):
+    for filename in filenames:
+        fullfilename = os.path.join(root, filename)
+        if fullfilename.find('/.') == -1 and not match(IGNORE, filename):
+            storename = fullfilename[len(DIRECTORY)+1:]
+            try:
+                info = os.stat(fullfilename)
+            except:
+                print('ERROR: Unable to get the status of', fullfilename)
+                print('ERROR: Is this file a broken link?')
+                sys.exit()
+            modified = int(info.st_mtime)
+            size = int(info.st_size)
+            if int(oct(info.st_mode)[-1:]) >= 4:
+                filesScanned[storename] = {'mod': modified, 'size': size, 'path': fullfilename}
+        # else:
+        #     print('DEBUG: Ignoring', fullfilename)
+
+'''
+Connect (or create) a sqlite3 database called 'database' within the .cms
+folder.
+'''
+if not os.path.exists(database):
+    print('Initializing database file', database)
+    db = sqlite3.connect(database)
+    cursor = db.cursor()
+    cursor.execute('''
+               CREATE TABLE IF NOT EXISTS files (
+                 storename TEXT PRIMARY KEY,
+                 path TEXT NOT NULL,
+                 mod INT NOT NULL,
+                 size INT NOT NULL,
+                 uploaded INT NOT NULL,
+                 cmsid TEXT NOT NULL )
+               ''')
+    db.commit()
+    cursor.execute('''
+               CREATE TABLE IF NOT EXISTS folders (
+                 pathname TEXT PRIMARY KEY,
+                 cmsid TEXT NOT NULL )
+               ''')
+    db.commit()
+else:
+    db = sqlite3.connect(database)
+    cursor = db.cursor()
+
+'''
+Retrieve a list of all files from the database that have been published to the
+Cascade server, resulting dictionary must have at least 'mod' and 'size'
+'''
+filesDB = {}
+cursor.execute('''
+           SELECT storename, path, mod, size, uploaded, cmsid FROM files
+           ''')
+rows = cursor.fetchall()
+for row in rows:
+    filesDB[row[0]] = {'path': row[1], 'mod': row[2], 'size': row[3], 'uploaded': row[4], 'cmsid': row[5]}
+
+'''
+Retrieve a list of all folders from the database that have been created on the
+Cascade server.
+'''
+foldersDB = {}
+cursor.execute('''
+           SELECT pathname, cmsid FROM folders
+           ''')
+rows = cursor.fetchall()
+for row in rows:
+    foldersDB[row[0]] = {'cmsid': row[1]}
+
+'''
+Search for new files in filesScanned but not in filesDB (or updated files)
+'''
+queueADD = {}
+queueMOD = {}
+queueADDfolder = []
+for storename in filesScanned:
+    dirname = os.path.dirname(storename)
+    if dirname != '':
+        folder = ''
+        for d in dirname.split('/'):
+            if folder != '':
+                folder = folder + '/'
+            folder = folder + d
+            if folder not in foldersDB and folder not in queueADDfolder:
+                queueADDfolder.append(folder)
+    if storename not in filesDB:
+        queueADD[storename] = filesScanned[storename]
+    elif filesDB[storename]['mod'] != filesScanned[storename]['mod'] or filesDB[storename]['size'] != filesScanned[storename]['size']:
+        queueMOD[storename] = filesScanned[storename]
+
+'''
+Search for deleted files in filesDB but not in filesScanned
+'''
+queueDEL = {}
+for storename in filesDB:
+    if storename not in filesScanned:
+        queueDEL[storename] = filesDB[storename]
+
+'''
+Do we have work to do?
+'''
+if len(queueADD) == 0 and len(queueMOD) == 0 and len(queueDEL) == 0:
+    print('NOTICE: No changes detected, existing')
+    sys.exit()
+
+'''
+Do we have stored credentials?
+'''
+if APIKEY is None:
+    if USERNAME is None:
+        print('ERROR: Please define the USERNAME variable in .cms/config.py')
+        sys.exit()
+    if PASSWORD is None:
+        print('NOTICE: PASSWORD variable can be defined in .cms/config.py but this is dangerous.')
+        PASSWORD = getpass.getpass(prompt='CMS Password: ', stream=None)
+
+'''
+The following are the API functions needed to talk with CMS
+'''
+
+'''
+Retrieve information from a REST style API
+Return the results in a python style dictionary
+https://stackoverflow.com/questions/11832639/how-to-specify-python-requests-http-put-body
+'''
+def post_api_json(API_BASE, API_PATH, HEADERS={}, PAYLOAD={}, DATA={}, TIMEOUT=99):
+    API_PATH = API_BASE + API_PATH
+    results = {}
+    success = '*'
+    if PAYLOAD == {} and HEADERS == {} and DATA == {}:
+        resp = requests.post(API_PATH, timeout=TIMEOUT)
+    elif PAYLOAD == {} and HEADERS != {} and DATA == {}:
+        resp = requests.post(API_PATH, headers=HEADERS, timeout=TIMEOUT)
+    elif PAYLOAD != {} and HEADERS == {} and DATA == {}:
+        resp = requests.post(API_PATH, json=PAYLOAD, timeout=TIMEOUT)
+    elif PAYLOAD != {} and HEADERS != {} and DATA == {}:
+        resp = requests.post(API_PATH, json=PAYLOAD, header=HEADERS, timeout=TIMEOUT)
+    elif PAYLOAD == {} and HEADERS == {} and DATA != {}:
+        resp = requests.post(API_PATH, data=DATA, timeout=TIMEOUT)
+    elif PAYLOAD == {} and HEADERS != {} and DATA != {}:
+        resp = requests.post(API_PATH, data=DATA, headers=HEADERS, timeout=TIMEOUT)
+    elif PAYLOAD != {} and HEADERS == {} and DATA != {}:
+        resp = requests.post(API_PATH, data=DATA, json=PAYLOAD, timeout=TIMEOUT)
+    elif PAYLOAD != {} and HEADERS != {} and DATA != {}:
+        resp = requests.post(API_PATH, data=DATA, json=PAYLOAD, header=HEADERS, timeout=TIMEOUT)
+    if resp.status_code == 200:
+        results = json.loads(resp.text)
+    if 'success' in results:
+        success = results['success']
+    return results, success
+
+'''
+Wrapper Function to call cascade CMS api and authenticate, returns data and success status
+'''
+def api(API_BASE, API_PATH, headers={}, payload={}, username=None, password=None, apikey=None, timeout=99):
+    if not 'authentication' in payload:
+        payload['authentication'] = {}
+    if username is not None and password is not None:
+        payload['authentication'] = {"username": USERNAME, "password": PASSWORD}
+    data, success = post_api_json(API_BASE, API_PATH, HEADERS=headers, PAYLOAD=payload, TIMEOUT=timeout)
+    return data, success
+
+'''
+Publish a page that has already been created
+'''
+def publish_page(API, path=None, id=None, site="User Sites CompSci - Public", username=None, password=None, apikey=None):
+    if path is not None:
+        payload = {"identifier": {"type": "file", "path": {"path": path, "siteName": site}}}
+    elif id is not None:
+        payload = {"identifier": {"type": "file", "id": id}}
+    else:
+        pass # need to handle error here...
+    data, success = api(API, 'publish', payload=payload, username=username, password=password, apikey=apikey)
+    return data, success
+
+'''
+Publish a folder that has already been created
+'''
+def publish_folder(API, path=None, id=None, site="User Sites CompSci - Public", username=None, password=None, apikey=None):
+    if path is not None:
+        payload = {"identifier": {"type": "folder", "path": {"path": path, "siteName": site}}}
+    elif id is not None:
+        payload = {"identifier": {"type": "folder", "id": id}}
+    else:
+        pass # need to handle error here...
+    data, success = api(API, 'publish', payload=payload, username=username, password=password, apikey=apikey)
+    return data, success
+
+'''
+Create a new file from a file upload.
+'''
+def create_page_bin(API, folder, filename, source, site="User Sites CompSci - Public", publish=True, username=None, password=None, apikey=None):
+    with open(source, "rb") as f:
+        contents = f.read()
+        data = [int(x) for x in contents]
+    payload = {'asset': {'file': {'name':filename,
+                                  'parentFolderPath': folder,
+                                  "siteName": site,
+                                  'data': data}}}
+    data, success = api(API, 'create', payload=payload, username=username, password=password, apikey=apikey)
+    if success and publish:
+        publish_page(API, id=data['createdAssetId'], username=username, password=password, apikey=apikey)
+    return data, success
+
+'''
+Replace the contents of a file with an upload
+'''
+def modify_page_bin(API, folder, filename, source, site="User Sites CompSci - Public", publish=True, username=None, password=None, apikey=None):
+    with open(source, "rb") as f:
+        contents = f.read()
+        data = [int(x) for x in contents]
+    payload = {'asset': {'file': {'path': folder+'/'+filename,
+                                  'parentFolderPath': folder,
+                                  "siteName": site,
+                                  'data': data}}}
+    data, success = api(API, 'edit', payload=payload, username=username, password=password, apikey=apikey)
+    if success and publish:
+        publish_page(API, path=folder+'/'+filename, site=site, username=username, password=password, apikey=apikey)
+    return data, success
+
+'''
+Delete a file
+'''
+def delete_page(API, path=None, id=None, site="User Sites CompSci - Public", username=None, password=None, apikey=None):
+    if path is not None:
+        payload = {"identifier": {"type": "file", "path": {"path": path, "siteName": site}}}
+    elif id is not None:
+        payload = {"identifier": {"type": "file", "id": id}}
+    else:
+        pass # need to handle error here...
+    data, success = api(API, 'delete', payload=payload, username=username, password=password, apikey=apikey)
+    return data, success
+
+'''
+Create a new folder
+'''
+def create_folder(API, parent, folder, site="User Sites CompSci - Public", publish=True, username=None, password=None, apikey=None):
+    payload = {'asset': {'folder': {'name':folder,
+                                  'parentFolderPath': parent,
+                                  "siteName": site }}}
+    data, success = api(API, 'create', payload=payload, username=username, password=password, apikey=apikey)
+    if success and publish:
+        publish_folder(API, path=parent+'/'+folder, site=site, username=username, password=password, apikey=apikey)
+    return data, success
+
+'''
+Lets now create each of the missing folders
+'''
+for folder in queueADDfolder:
+    parentFolder = ROOT
+    upper = folder
+    if folder.find('/') != -1:
+        upper = folder.split('/')[-1]
+        lower = folder.split('/')[:-1]
+        lower = '/'.join(lower)
+        parentFolder = parentFolder + '/' + lower
+    print('DEBUG:', 'folder_add', upper, 'in', parentFolder)
+    data, success = create_folder(API, parentFolder, upper, site=SITE, publish=PUBLISH_AS_YOU_GO, username=USERNAME, password=PASSWORD, apikey=APIKEY)
+    if not success:
+        print('ERROR: Unable to create folder', upper, 'within', parentFolder)
+        print('ERROR:', data)
+        sys.exit()
+    cmsid = data['createdAssetId']
+    values = (folder, cmsid,)
+    cursor.execute('INSERT INTO folders VALUES (?, ?)', values)
+    db.commit()
+
+'''
+Lets upload each of the missing files now
+'''
+for storename in queueADD:
+    row = queueADD[storename]
+    mod = row['mod']
+    size = row['size']
+    path = row['path']
+    upper = storename
+    parentFolder = ROOT
+    if upper.find('/') != -1:
+        lower = upper.split('/')[:-1]
+        lower = '/'.join(lower)
+        upper = upper.split('/')[-1]
+        parentFolder = parentFolder + '/' + lower
+    data, success = create_page_bin(API, parentFolder, upper, path, site=SITE, publish=PUBLISH_AS_YOU_GO, username=USERNAME, password=PASSWORD, apikey=APIKEY)
+    if not success:
+        print('ERROR: Failed upload attempt for', storename)
+        print('ERROR: Located at', path)
+        print('ERROR: Error was:', data)
+        sys.exit()
+    cmsid = data['createdAssetId']
+    uploaded = int(time.time())
+    print('DEBUG:', 'add', storename, path, mod, size, uploaded, cmsid)
+    values = (storename, path, mod, size, uploaded, cmsid, )
+    cursor.execute('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)', values)
+    db.commit()
+
+'''
+Lets upload each of the modified files now
+'''
+for storename in queueMOD:
+    row = queueMOD[storename]
+    mod = row['mod']
+    size = row['size']
+    path = row['path']
+    uploaded = int(time.time())
+    upper = storename
+    parentFolder = ROOT
+    if upper.find('/') != -1:
+        lower = upper.split('/')[:-1]
+        lower = '/'.join(lower)
+        upper = upper.split('/')[-1]
+        parentFolder = parentFolder + '/' + lower
+    print('DEBUG:', 'mod', storename, mod, size, uploaded)
+    data, success = modify_page_bin(API, parentFolder, upper, path, site=SITE, publish=PUBLISH_AS_YOU_GO, username=USERNAME, password=PASSWORD, apikey=APIKEY)
+    if not success:
+        print('ERROR: Failed update attempt for', storename)
+        print('ERROR: Error was:', data)
+        sys.exit()
+    values = (mod, size, uploaded, storename, )
+    cursor.execute('UPDATE files SET mod=?, size=?, uploaded=? WHERE storename=?', values)
+    db.commit()
+
+'''
+Lets delete each removed file now
+'''
+for storename in queueDEL:
+    row = queueDEL[storename]
+    mod = row['mod']
+    size = row['size']
+    path = row['path']
+    cmsid = row['cmsid']
+    delpath = ROOT+'/'+storename
+    print('DEBUG:', 'del', delpath, mod, size, cmsid)
+    success, data = delete_page(API, path=delpath, site=SITE, username=USERNAME, password=PASSWORD, apikey=APIKEY)
+    if not success:
+        print('ERROR: Failed delete attempt for', storename)
+        print('ERROR: Error was:', data)
+        sys.exit()
+    values = (storename, )
+    cursor.execute('DELETE FROM files WHERE storename=?', values)
+    db.commit()
+
+'''
+Perform a final publish after the changes were made
+'''
+print('DEBUG:', 'site publish', PUBLISH)
+data, success = publish_folder(API, PUBLISH, site=SITE, username=USERNAME, password=PASSWORD, apikey=APIKEY)
+print(data)
+if not success:
+    print('ERROR: Failed publish attempt for', ROOT)
+    print('ERROR: Error was:', data)
+    sys.exit()
