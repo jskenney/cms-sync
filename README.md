@@ -4,9 +4,9 @@ A Python3 script to sync folders with Cascade CMS.  This program will scan the c
 # Installation Instructions
 The code below will clone the repository into your home directory.
 
-`cd
-git clone https://github.com/jskenney/cms-sync.git
-cd cms-sync
+`cd ;
+git clone https://github.com/jskenney/cms-sync.git ;
+cd cms-sync ;
 chmod 755 cmssync`
 
 # Configuration
