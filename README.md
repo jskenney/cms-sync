@@ -15,3 +15,7 @@ Once you have the repository cloned, the next step is to go into the folder you 
 # Performing the sync
 Go into the folder that has the .cms directory and run:
 `~/cms-sync/cmssync`
+
+# Frequently Asked Questions
+- Will it upload all files?  Yes, as long as they are not in the ignore list (in config.py), start with a dot, and are world readable.
+- Does it break?  Yes, the program will stop and alert to any error (file naming, etc) and you will need to correct it before moving on.
