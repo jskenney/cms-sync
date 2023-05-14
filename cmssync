@@ -58,6 +58,11 @@ except:
     IGNORE = []
 
 try:
+    from config import DONT_IGNORE
+except:
+    DONT_IGNORE = []
+
+try:
     from config import ROOT
 except:
     print('ERROR: Please define the ROOT variable in .cms/config.py to continue')
@@ -99,27 +104,57 @@ def match(haystack, needle):
     return 0
 
 '''
+Simple function to check to see if a directory is world executable, and
+not blocked.
+'''
+def dirCheck(directory, db, IGNORE, DONT_IGNORE):
+    if directory in db:
+        return db[directory]
+    parts = directory.split('/')
+    check = ''
+    results = True
+    for part in parts[1:]:
+        check = check + '/' + part
+        if check not in db:
+            if int(oct(os.stat(check).st_mode)[-1:]) % 2:
+                if part in DONT_IGNORE:
+                    db[check] = True
+                elif part not in IGNORE and part.find('.') != 0 and check not in IGNORE:
+                    db[check] = True
+                else:
+                    db[check] = False
+                    return False
+            else:
+                db[check] = False
+                return False
+        elif db[check] == False:
+            return False
+    return results
+
+'''
 Create a list of all files in the DIRECTORY that:
 Do not start with . AND are world readable
 '''
 filesScanned = {}
+dirPermissions = {'/':True}
 for root, dirnames, filenames in os.walk(DIRECTORY):
     for filename in filenames:
-        fullfilename = os.path.join(root, filename)
-        if fullfilename.find('/.') == -1 and not match(IGNORE, filename):
-            storename = fullfilename[len(DIRECTORY)+1:]
-            try:
-                info = os.stat(fullfilename)
-            except:
-                print('ERROR: Unable to get the status of', fullfilename)
-                print('ERROR: Is this file a broken link?')
-                sys.exit()
-            modified = int(info.st_mtime)
-            size = int(info.st_size)
-            if int(oct(info.st_mode)[-1:]) >= 4:
-                filesScanned[storename] = {'mod': modified, 'size': size, 'path': fullfilename}
-        # else:
-        #     print('DEBUG: Ignoring', fullfilename)
+        if dirCheck(root, dirPermissions, IGNORE, DONT_IGNORE):
+            fullfilename = os.path.join(root, filename)
+            if filename in DONT_IGNORE or (filename.find('.') != 0 and not match(IGNORE, filename)):
+                storename = fullfilename[len(DIRECTORY)+1:]
+                try:
+                    info = os.stat(fullfilename)
+                except:
+                    print('ERROR: Unable to get the status of', fullfilename)
+                    print('ERROR: Is this file a broken link?')
+                    sys.exit()
+                modified = int(info.st_mtime)
+                size = int(info.st_size)
+                if int(oct(info.st_mode)[-1:]) >= 4:
+                    filesScanned[storename] = {'mod': modified, 'size': size, 'path': fullfilename}
+            # else:
+            #     print('DEBUG: Ignoring', fullfilename)
 
 '''
 Connect (or create) a sqlite3 database called 'database' within the .cms

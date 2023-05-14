@@ -35,5 +35,10 @@ PUBLISH_AS_YOU_GO = False
 # would be blocked from syncing
 IGNORE = ['cmssync.py']
 
+# Since the system ignores everything with a ., there may be exceptions that
+# will be necessary, add files or directories with dots in front of them that
+# we shouldn't ignore
+DONT_IGNORE = ['.htaccess']
+
 # Enter the location of the API endpoint for your local castade server.
 API = 'https://domain.com/api/v1/'
