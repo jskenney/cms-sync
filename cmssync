@@ -264,7 +264,7 @@ Retrieve information from a REST style API
 Return the results in a python style dictionary
 https://stackoverflow.com/questions/11832639/how-to-specify-python-requests-http-put-body
 '''
-def post_api_json(API_BASE, API_PATH, HEADERS={}, PAYLOAD={}, DATA={}, TIMEOUT=99):
+def post_api_json(API_BASE, API_PATH, HEADERS={}, PAYLOAD={}, DATA={}, TIMEOUT=600):
     API_PATH = API_BASE + API_PATH
     results = {}
     success = '*'
@@ -293,7 +293,7 @@ def post_api_json(API_BASE, API_PATH, HEADERS={}, PAYLOAD={}, DATA={}, TIMEOUT=9
 '''
 Wrapper Function to call cascade CMS api and authenticate, returns data and success status
 '''
-def api(API_BASE, API_PATH, headers={}, payload={}, username=None, password=None, apikey=None, timeout=99):
+def api(API_BASE, API_PATH, headers={}, payload={}, username=None, password=None, apikey=None, timeout=600):
     if not 'authentication' in payload:
         payload['authentication'] = {}
     if username is not None and password is not None:
